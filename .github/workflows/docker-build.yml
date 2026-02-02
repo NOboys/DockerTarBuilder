@@ -1,0 +1,84 @@
+name: General Docker Build (No Push)
+
+on:
+  # 推荐手动触发，可传入自定义参数
+  workflow_dispatch:
+    inputs:
+      dockerfile_path:
+        description: 'Dockerfile路径（相对于仓库根目录）'
+        required: true
+        default: 'work/dockerfile'
+        type: string
+      image_name:
+        description: '构建出的镜像名称（仅本地标签用）'
+        required: true
+        default: 'custom-built-image'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # 每个job都在一个全新的、隔离的虚拟运行器中执行，环境独立
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        # 仅在当前运行器内设置Buildx，不影响外部
+
+      - name: Validate Dockerfile
+        run: |
+          if [ ! -f "${{ github.event.inputs.dockerfile_path }}" ]; then
+            echo "❌ 错误：未找到文件 ${{ github.event.inputs.dockerfile_path }}"
+            exit 1
+          fi
+          echo "✅ Dockerfile路径有效。"
+
+      # 核心：构建但不推送
+      - name: Build Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ github.event.inputs.dockerfile_path }}
+          push: false
+          tags: ${{ github.event.inputs.image_name }}:latest
+          # 关键：缓存仅保存在本工作流定义的临时目录中
+          cache-from: type=gha, scope=${{ github.workflow }}-${{ github.event.inputs.dockerfile_path }}
+          cache-to: type=gha, scope=${{ github.workflow }}-${{ github.event.inputs.dockerfile_path }}, mode=max
+          outputs: type=docker, dest=/tmp/image_${{ github.run_id }}.tar
+          # 如果您需要传递构建参数，可以在此添加，例如：
+          # build-args: |
+          #   ARG1=value1
+
+      # 可选：将镜像打包为工件，6小时后自动删除
+      - name: Upload Image as Temporary Artifact
+        if: success() # 仅在构建成功后上传
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ github.run_id }}
+          path: /tmp/image_${{ github.run_id }}.tar
+          retention-days: 0.25 # 6小时后自动删除
+          compression-level: 9
+
+      # 🔒 安全且隔离的清理步骤
+      - name: Cleanup (Scoped to This Run)
+        if: always() # 无论构建成功与否都执行清理
+        run: |
+          echo "开始执行隔离清理..."
+          
+          # 1. 仅删除本次运行创建的、明确知道的临时文件
+          echo "删除本次运行的临时文件..."
+          rm -f /tmp/image_${{ github.run_id }}.tar
+          
+          # 2. 清理本次构建可能产生的Docker悬空镜像（非常安全，不影响他人）
+          # `docker image prune -f` 仅删除悬空的（没有标签且未被任何容器引用）的镜像
+          # 这些镜像仅由本次构建过程产生，不会触及他人镜像
+          echo "清理悬空的Docker镜像层..."
+          docker image prune -f
+          
+          # 3. （可选）输出清理报告，确认影响范围
+          echo "=== 清理完成报告 ==="
+          echo "工作流ID：${{ github.run_id }}"
+          echo "清理范围：仅限本次任务创建的临时文件和悬空镜像层"
+          echo "提示：GitHub Actions运行器在任务结束后将被整体销毁，所有剩余文件也会被清除。"
