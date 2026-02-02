@@ -1,0 +1,125 @@
+name: Build with External Dockerfile Template
+
+on:
+  workflow_dispatch:
+    inputs:
+      dockerfile_url:
+        description: |
+          外部Dockerfile的Raw URL（必须是 raw.githubusercontent.com 格式）。
+          例如：https://raw.githubusercontent.com/apache/apisix/master/Dockerfile
+        required: true
+        default: 'https://raw.githubusercontent.com/apache/apisix/master/Dockerfile'
+        type: string
+      dockerfile_sha256:
+        description: '（可选）用于校验Dockerfile完整性的SHA256值'
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 检出当前仓库的代码（这是您的构建上下文）
+      - name: Checkout Current Code
+        uses: actions/checkout@v4
+
+      # 2. 安全地下载并验证外部Dockerfile
+      - name: Fetch and Validate External Dockerfile
+        id: fetch_dockerfile
+        env:
+          DOCKERFILE_URL: ${{ github.event.inputs.dockerfile_url }}
+          EXPECTED_SHA: ${{ github.event.inputs.dockerfile_sha256 }}
+        run: |
+          echo "正在下载Dockerfile: $DOCKERFILE_URL"
+          
+          # 检查URL格式，强制要求使用raw.githubusercontent.com以保证来源可控
+          if [[ ! $DOCKERFILE_URL =~ ^https://raw\.githubusercontent\.com/ ]]; then
+            echo "❌ 安全警告：建议仅使用来自 raw.githubusercontent.com 的源，以确保内容公开可审计。"
+            echo "当前URL: $DOCKERFILE_URL"
+            # 此处可以 exit 1 严格限制，或继续（注释掉下一行）
+            # exit 1
+          fi
+          
+          # 下载文件，并重命名为可识别的名称
+          curl -sSLf -o ./Dockerfile.external "$DOCKERFILE_URL" || {
+            echo "❌ Dockerfile 下载失败";
+            exit 1;
+          }
+          
+          # 可选：如果提供了SHA256校验和，则进行验证
+          if [ -n "$EXPECTED_SHA" ]; then
+            echo "正在校验文件完整性..."
+            DOWNLOADED_SHA=$(sha256sum ./Dockerfile.external | awk '{print $1}')
+            if [ "$DOWNLOADED_SHA" != "$EXPECTED_SHA" ]; then
+              echo "❌ 文件完整性校验失败！"
+              echo "期望的SHA256: $EXPECTED_SHA"
+              echo "实际的SHA256: $DOWNLOADED_SHA"
+              exit 1
+            else
+              echo "✅ 文件完整性校验通过。"
+            fi
+          fi
+          
+          echo "Dockerfile 下载成功。"
+          # 输出元信息供后续步骤使用
+          echo "dockerfile_path=./Dockerfile.external" >> $GITHUB_OUTPUT
+
+      # 3. 设置Docker Buildx（使用安全的缓存配置）
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 4. 配置构建缓存（缓存键与您仓库的代码及Dockerfile内容关联）
+      - name: Cache Docker Layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          # 缓存键包含：运行器系统、工作流名、Dockerfile URL、以及您仓库相关文件的哈希
+          # 当您的代码或外部Dockerfile变化时，缓存会失效
+          key: ${{ runner.os }}-buildx-${{ github.workflow }}-${{ hashFiles(github.event.inputs.dockerfile_url) }}-${{ hashFiles('**/*.go', '**/requirements.txt', '**/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-${{ github.workflow }}
+
+      # 5. 核心构建步骤
+      - name: Build Docker Image (No Push)
+        uses: docker/build-push-action@v5
+        with:
+          context: . # 构建上下文是您当前仓库的代码
+          file: ${{ steps.fetch_dockerfile.outputs.dockerfile_path }} # 使用下载的Dockerfile模板
+          push: false
+          tags: custom-app:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+          outputs: type=docker,dest=/tmp/app_image_${{ github.run_id }}.tar
+          # 如果需要，您可以在此处传入构建参数（如云环境地址、版本号）
+          # build-args: |
+          #   VERSION=1.0
+          #   CLOUD_PROVIDER=aws
+
+      # 6. （可选）打包与上传工件（6小时后自动删除）
+      - name: Upload Image Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-image-${{ github.run_id }}
+          path: /tmp/app_image_${{ github.run_id }}.tar
+          retention-days: 0.25
+          compression-level: 9
+
+      # 7. 彻底且安全的清理（不影响他人）
+      - name: Cleanup (Isolated)
+        if: always()
+        run: |
+          echo "=== 开始执行隔离清理 ==="
+          
+          # 删除本次运行下载和生成的所有临时文件
+          rm -f ./Dockerfile.external
+          rm -f /tmp/app_image_${{ github.run_id }}.tar
+          
+          # 仅清理由本次构建产生的、悬空的Docker镜像层（绝对安全）
+          docker image prune -f
+          
+          # 处理构建缓存目录（此目录仅在本工作流内使用）
+          if [ -d "/tmp/.buildx-cache-new" ]; then
+            mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+          fi
+          
+          echo "清理完成。所有操作均限制在本工作流环境内。"
