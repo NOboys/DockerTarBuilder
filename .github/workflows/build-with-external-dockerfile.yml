@@ -1,35 +1,20 @@
-name: Universal Docker Build with Variable Override
+name: Simple Universal Docker Build
 
 on:
   workflow_dispatch:
     inputs:
       dockerfile_url:
-        description: |
-          外部Dockerfile的Raw URL
-          示例: https://raw.githubusercontent.com/user/repo/branch/path/Dockerfile
+        description: 'Dockerfile的Raw URL'
         required: true
         default: ''
         type: string
-      dockerfile_path_in_repo:
-        description: |
-          Dockerfile在当前仓库的相对路径（二选一）
-          如果同时提供两者，优先使用URL
+      build_args_json:
+        description: '构建参数的JSON格式，例如: {"ENABLE_PROXY":"false","VERSION":"1.0"}'
         required: false
-        default: 'Dockerfile'
-        type: string
-      # 通用构建参数输入（键值对格式）
-      build_args_input:
-        description: |
-          构建参数，每行一个 KEY=VALUE
-          示例:
-          VERSION=1.0
-          ENVIRONMENT=production
-          CUSTOM_ARG=value
-        required: false
-        default: ''
+        default: '{}'
         type: string
       image_name:
-        description: '构建出的本地镜像名称'
+        description: '镜像名称'
         required: false
         default: 'built-image'
         type: string
@@ -38,197 +23,38 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      # 1. 检出当前仓库代码
-      - name: Checkout Current Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. 获取Dockerfile（支持外部URL和本地文件两种方式）
-      - name: Get Dockerfile
-        id: get_dockerfile
-        env:
-          DOCKERFILE_URL: ${{ github.event.inputs.dockerfile_url }}
-          LOCAL_DOCKERFILE_PATH: ${{ github.event.inputs.dockerfile_path_in_repo }}
+      - name: Download Dockerfile
         run: |
-          FINAL_DOCKERFILE_PATH="./Dockerfile.override"
-          
-          # 优先使用外部URL
-          if [ -n "$DOCKERFILE_URL" ]; then
-            echo "正在从外部URL下载Dockerfile: $DOCKERFILE_URL"
-            curl -sSLf -o "$FINAL_DOCKERFILE_PATH" "$DOCKERFILE_URL"
-            echo "✅ 使用外部Dockerfile"
-          elif [ -f "$LOCAL_DOCKERFILE_PATH" ]; then
-            echo "正在使用本地Dockerfile: $LOCAL_DOCKERFILE_PATH"
-            cp "$LOCAL_DOCKERFILE_PATH" "$FINAL_DOCKERFILE_PATH"
-            echo "✅ 使用本地Dockerfile"
-          else
-            echo "❌ 错误：未找到Dockerfile"
-            echo "请提供 dockerfile_url 或确保 dockerfile_path_in_repo 存在"
-            exit 1
-          fi
-          
-          # 输出Dockerfile路径供后续步骤使用
-          echo "dockerfile_path=$FINAL_DOCKERFILE_PATH" >> $GITHUB_OUTPUT
-          
-          # 显示Dockerfile基本信息
-          echo "=== Dockerfile信息 ==="
-          echo "文件大小: $(wc -l < "$FINAL_DOCKERFILE_PATH") 行"
-          echo "前5行内容:"
-          head -5 "$FINAL_DOCKERFILE_PATH"
+          echo "下载Dockerfile: ${{ github.event.inputs.dockerfile_url }}"
+          curl -sSLf -o ./Dockerfile.external "${{ github.event.inputs.dockerfile_url }}"
 
-      # 3. 解析构建参数（支持从输入和多来源）
-      - name: Parse Build Arguments
-        id: parse_build_args
-        env:
-          BUILD_ARGS_INPUT: ${{ github.event.inputs.build_args_input }}
-        run: |
-          BUILD_ARGS_FILE="./.build-args.env"
-          
-          echo "正在解析构建参数..."
-          
-          # 方法1：从输入的多行文本解析（每行 KEY=VALUE）
-          if [ -n "$BUILD_ARGS_INPUT" ]; then
-            echo "$BUILD_ARGS_INPUT" > "$BUILD_ARGS_FILE"
-            echo "✅ 从输入解析了 $(echo "$BUILD_ARGS_INPUT" | wc -l) 个构建参数"
-          fi
-          
-          # 方法2：（可选）从仓库的配置文件读取
-          if [ -f ".github/docker-build-args.env" ]; then
-            cat ".github/docker-build-args.env" >> "$BUILD_ARGS_FILE"
-            echo "✅ 添加了仓库配置的构建参数"
-          fi
-          
-          # 方法3：（可选）从环境变量读取特定前缀的变量
-          # 例如所有以 BUILD_ARG_ 开头的环境变量
-          env | grep '^BUILD_ARG_' | sed 's/^BUILD_ARG_//' >> "$BUILD_ARGS_FILE" 2>/dev/null || true
-          
-          # 去重并格式化
-          if [ -f "$BUILD_ARGS_FILE" ]; then
-            # 移除空行和注释，去重
-            grep -v '^#' "$BUILD_ARGS_FILE" | grep -v '^$' | sort -u > "${BUILD_ARGS_FILE}.tmp"
-            mv "${BUILD_ARGS_FILE}.tmp" "$BUILD_ARGS_FILE"
-            
-            echo "=== 最终构建参数 ==="
-            cat "$BUILD_ARGS_FILE"
-            
-            # 将构建参数转换为JSON数组，供后续步骤使用
-            BUILD_ARGS_JSON="["
-            while IFS='=' read -r key value || [ -n "$key" ]; do
-              if [ -n "$key" ]; then
-                # 对值进行JSON转义
-                escaped_value=$(echo "$value" | sed 's/"/\\"/g')
-                if [ -n "$BUILD_ARGS_JSON" ] && [ "$BUILD_ARGS_JSON" != "[" ]; then
-                  BUILD_ARGS_JSON="$BUILD_ARGS_JSON,"
-                fi
-                BUILD_ARGS_JSON="$BUILD_ARGS_JSON{\"name\":\"$key\",\"value\":\"$escaped_value\"}"
-              fi
-            done < "$BUILD_ARGS_FILE"
-            BUILD_ARGS_JSON="$BUILD_ARGS_JSON]"
-            
-            echo "build_args_json=$BUILD_ARGS_JSON" >> $GITHUB_OUTPUT
-          else
-            echo "build_args_json=[]" >> $GITHUB_OUTPUT
-          fi
-
-      # 4. 设置Docker Buildx
-      - name: Set up Docker Buildx
+      - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 5. 核心构建步骤 - 动态应用构建参数
-      - name: Build Docker Image with Dynamic Args
-        id: build_image
-        env:
-          IMAGE_NAME: ${{ github.event.inputs.image_name || 'built-image' }}
-          DOCKERFILE_PATH: ${{ steps.get_dockerfile.outputs.dockerfile_path }}
-        run: |
-          echo "开始构建镜像: $IMAGE_NAME"
-          
-          # 从JSON解析构建参数并转换为--build-arg参数
-          BUILD_ARGS=""
-          BUILD_ARGS_JSON='${{ steps.parse_build_args.outputs.build_args_json }}'
-          
-          if [ "$BUILD_ARGS_JSON" != "[]" ]; then
-            echo "应用的构建参数:"
-            
-            # 使用jq解析JSON数组（如果可用）
-            if command -v jq &> /dev/null; then
-              BUILD_ARGS=$(echo "$BUILD_ARGS_JSON" | jq -r '.[] | "--build-arg \(.name)=\(.value)"' | tr '\n' ' ')
-              echo "$BUILD_ARGS_JSON" | jq -r '.[] | "  \(.name)=\(.value)"'
-            else
-              # 如果没有jq，使用简单的字符串处理
-              # 这里简化处理，实际应用中建议安装jq
-              echo "⚠️  jq不可用，使用简化参数处理"
-              # 从之前生成的env文件读取
-              while IFS='=' read -r key value || [ -n "$key" ]; do
-                if [ -n "$key" ]; then
-                  BUILD_ARGS="$BUILD_ARGS --build-arg $key=$value"
-                  echo "  $key=$value"
-                fi
-              done < "./.build-args.env"
-            fi
-          fi
-          
-          # 执行构建
-          docker buildx build \
-            --file "$DOCKERFILE_PATH" \
-            --tag "$IMAGE_NAME:latest" \
-            --output type=docker,dest="/tmp/image_${{ github.run_id }}.tar" \
-            $BUILD_ARGS \
-            .
-          
-          # 验证构建结果
-          echo "✅ 镜像构建完成"
-          echo "镜像文件: /tmp/image_${{ github.run_id }}.tar"
-          echo "镜像大小: $(du -h "/tmp/image_${{ github.run_id }}.tar" | cut -f1)"
+      - name: Build with Dynamic Args
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.external
+          push: false
+          tags: ${{ github.event.inputs.image_name }}:latest
+          outputs: type=docker,dest=/tmp/image-${{ github.run_id }}.tar
+          # 关键：直接从JSON输入生成build-args
+          build-args: |
+            ${{ fromJSON(github.event.inputs.build_args_json) }}
 
-      # 6. 可选：验证镜像
-      - name: Quick Image Verification
-        run: |
-          echo "快速验证镜像..."
-          docker load --input "/tmp/image_${{ github.run_id }}.tar"
-          docker image ls | grep "${{ github.event.inputs.image_name || 'built-image' }}"
-          
-          # 输出镜像基本信息
-          echo "镜像详情:"
-          docker inspect "${{ github.event.inputs.image_name || 'built-image' }}:latest" \
-            --format='{{json .Config.Labels}}' 2>/dev/null | jq . 2>/dev/null || \
-            echo "无法获取标签信息"
-
-      # 7. 上传为临时工件（6小时自动删除）
-      - name: Upload as Temporary Artifact
+      - name: Upload Image
         uses: actions/upload-artifact@v4
         with:
-          name: docker-image-${{ github.run_id }}
-          path: /tmp/image_${{ github.run_id }}.tar
+          name: docker-image
+          path: /tmp/image-${{ github.run_id }}.tar
           retention-days: 0.25
-          compression-level: 9
-          if-no-files-found: error
 
-      # 8. 安全清理
-      - name: Cleanup (Isolated)
+      - name: Cleanup
         if: always()
-        env:
-          RUN_ID: ${{ github.run_id }}
-          IMAGE_NAME: ${{ github.event.inputs.image_name || 'built-image' }}
         run: |
-          echo "开始清理..."
-          
-          # 1. 删除临时文件
-          rm -f \
-            "./Dockerfile.override" \
-            "./.build-args.env" \
-            "/tmp/image_${RUN_ID}.tar" \
-            2>/dev/null || true
-          
-          # 2. 移除本工作流创建的镜像
-          docker rmi "${IMAGE_NAME}:latest" 2>/dev/null || true
-          
-          # 3. 清理悬空资源（仅限本次运行产生的）
-          docker image prune -f 2>/dev/null || true
-          
-          # 4. 清理构建缓存（不影响其他任务）
-          if [ -d "/tmp/.buildx-cache" ]; then
-            find /tmp/.buildx-cache -type f -mtime +1 -delete 2>/dev/null || true
-          fi
-          
-          echo "✅ 清理完成"
-          echo "所有临时文件已删除，未影响其他工作流"
+          rm -f ./Dockerfile.external /tmp/image-${{ github.run_id }}.tar
+          docker image prune -f
